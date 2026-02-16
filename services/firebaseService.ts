@@ -345,10 +345,11 @@ export const syncMetaCampaigns = async (clientId: string): Promise<{success: boo
         }
 
         // 3. Chamada REAL à API do Facebook (Graph API)
-        // MUDANÇA CRÍTICA: use_account_attribution_setting=true para forçar a API a respeitar a janela de atribuição do Ads Manager (o que você vê na tela).
-        // Também mudamos para Query Params no date_preset para evitar problemas de aninhamento.
-        const apiUrl = `https://graph.facebook.com/v19.0/${accountId}/campaigns?fields=name,status,insights{spend,impressions,clicks,cpc,ctr,action_values,actions}&date_preset=maximum&use_account_attribution_setting=true&limit=200&access_token=${token}`;
+        // Adicionamos 'objective' para ajudar a adivinhar o tipo de resultado
+        const apiUrl = `https://graph.facebook.com/v19.0/${accountId}/campaigns?fields=name,status,objective,insights{spend,impressions,clicks,cpc,ctr,action_values,actions,inline_link_clicks}&date_preset=maximum&use_account_attribution_setting=true&limit=200&access_token=${token}`;
 
+        console.log(`[MetaSync] Buscando campanhas de: ${accountId}`);
+        
         const response = await fetch(apiUrl);
         const data = await response.json();
 
@@ -369,15 +370,24 @@ export const syncMetaCampaigns = async (clientId: string): Promise<{success: boo
 
         for (const item of data.data) {
             const insight = item.insights?.data?.[0] || {};
-            
-            // Cálculo seguro de ROAS
+            const objective = item.objective || '';
+
+            // Debug no console para o usuário ver o que está vindo
+            console.log(`[MetaSync] Campanha: ${item.name} | Objetivo: ${objective}`);
+            console.log(`[MetaSync] Ações RAW:`, insight.actions);
+
+            // --- CÁLCULO DE RECEITA ---
             let revenue = 0;
             if (insight.action_values) {
-                const purchaseAction = insight.action_values.find((av: any) => av.action_type === 'purchase' || av.action_type === 'offsite_conversion.fb_pixel_purchase');
+                const purchaseAction = insight.action_values.find((av: any) => 
+                    av.action_type === 'purchase' || 
+                    av.action_type === 'omni_purchase' ||
+                    av.action_type === 'offsite_conversion.fb_pixel_purchase'
+                );
                 if (purchaseAction) revenue = Number(purchaseAction.value);
             }
             
-            // --- CORREÇÃO DE MAPEAMENTO PARA WHATSAPP & LEADS ---
+            // --- MAPEAMENTO DE RESULTADOS (GRADE DE PESCA) ---
             let conversations = 0;
             let leads = 0;
 
@@ -386,30 +396,46 @@ export const syncMetaCampaigns = async (clientId: string): Promise<{success: boo
                     const type = action.action_type;
                     const val = Number(action.value);
 
-                    // 1. Mapeamento Robusto de Conversas (WhatsApp, Direct, Messenger)
-                    // Agora inclui também replies e first_reply que algumas contas usam.
+                    // A. CONVERSAS (MENSAGENS)
                     if (
-                        type.includes('messaging_conversation_started') || 
-                        type.includes('messaging_first_reply') ||
-                        type === 'onsite_conversion.messaging_replies'
+                        type.includes('messaging_conversation_started') ||
+                        type === 'onsite_conversion.messaging_conversation_started_7d'
                     ) {
                         conversations += val;
                     }
 
-                    // 2. Mapeamento Robusto de Leads
-                    // Inclui contatos e leads agrupados
+                    // B. LEADS & CADASTROS
                     if (
                         type === 'lead' || 
                         type === 'offsite_conversion.fb_pixel_lead' || 
-                        type === 'contact_total' || 
+                        type === 'on_facebook_lead' || // Form Nativo
                         type === 'contact' ||
-                        type.includes('lead_grouped')
+                        type === 'submit_application' || 
+                        type === 'schedule' ||
+                        type === 'lead_grouped' ||
+                        type === 'mobile_app_install' // App Installs contam como "Leads" para métrica de volume
                     ) {
                         leads += val;
                     }
                 });
             }
 
+            // --- HEURÍSTICA DE TRÁFEGO PARA WHATSAPP ---
+            // Se a campanha é de tráfego/vendas, tem cliques no link, mas 0 conversas oficiais,
+            // muitas vezes a agência quer ver os Cliques no Link como "Conversas Iniciadas" (clique no link do zap)
+            const isTrafficObjective = objective.includes('TRAFFIC') || objective.includes('OUTCOME_TRAFFIC') || objective.includes('LINK_CLICKS');
+            const linkClicks = Number(insight.inline_link_clicks || insight.clicks || 0);
+
+            if (conversations === 0 && leads === 0 && isTrafficObjective && linkClicks > 0) {
+                // Opcional: Para não zerar o dashboard, assumimos cliques no link como "tentativa de conversa"
+                // Isso é polêmico, mas resolve o problema visual de "Campanha de Zap com 0 conversas"
+                // Descomente a linha abaixo se quiser forçar isso:
+                // conversations = linkClicks; 
+                console.log(`[MetaSync] Campanha de Tráfego sem conversas rastreadas. Cliques no link: ${linkClicks}`);
+            }
+
+            // Se ainda assim for zero, tenta pegar 'results' genérico se disponível (raro na API Graph padrão sem breakdown)
+            
             const spend = Number(insight.spend || 0);
             const roas = spend > 0 ? revenue / spend : 0;
 
@@ -440,7 +466,7 @@ export const syncMetaCampaigns = async (clientId: string): Promise<{success: boo
             }
         }
 
-        return { success: true, message: `Sincronização REAL concluída! ${newCount} novas, ${updateCount} atualizadas.` };
+        return { success: true, message: `Sincronização concluída! Olhe o console (F12) para ver detalhes dos dados brutos.` };
 
     } catch (error: any) {
         console.error(error);
