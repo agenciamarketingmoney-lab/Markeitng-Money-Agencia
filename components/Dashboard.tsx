@@ -524,8 +524,8 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
                     <span className="flex items-center gap-1"><div className="w-2 h-2 rounded-full bg-slate-300"></div> Regular</span>
                 </div>
                 
-                <div className="h-[320px] w-full mt-4">
-                    <ResponsiveContainer width="100%" height="100%">
+                <div className="h-[320px] w-full mt-4 min-w-0">
+                    <ResponsiveContainer width="100%" height="100%" debounce={200}>
                         <ScatterChart margin={{ top: 20, right: 20, bottom: 20, left: 10 }}>
                             <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.05)" />
                             <XAxis type="number" dataKey="x" name="Investimento" unit="R$" tick={{fontSize: 10, fill: '#94a3b8'}} tickFormatter={(val) => `R$${val/1000}k`} />
@@ -661,8 +661,8 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
           </GlassCard>
 
           <GlassCard title="Comparativo de Volume (Top 5)" className="min-h-[300px]">
-              <div className="h-[280px] w-full mt-2">
-                 <ResponsiveContainer width="100%" height="100%">
+              <div className="h-[280px] w-full mt-2 min-w-0">
+                 <ResponsiveContainer width="100%" height="100%" debounce={200}>
                     <BarChart data={funnelData} layout="vertical" margin={{top: 5, right: 30, left: 40, bottom: 5}}>
                         <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(0,0,0,0.05)" />
                         <XAxis type="number" hide />
