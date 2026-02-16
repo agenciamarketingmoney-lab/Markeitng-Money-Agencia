@@ -316,8 +316,8 @@ export const addCampaign = async (campaign: Omit<Campaign, 'id'>) => {
     }
 }
 
-// --- SYNC ENGINE (IMPLEMENTAÇÃO REAL) ---
-export const syncMetaCampaigns = async (clientId: string): Promise<{success: boolean, message: string}> => {
+// --- SYNC ENGINE (IMPLEMENTAÇÃO ROBUSTA - "SMART PARSER" + DATE FILTER) ---
+export const syncMetaCampaigns = async (clientId: string, datePreset: string = 'maximum'): Promise<{success: boolean, message: string}> => {
     try {
         // 1. Obter Token e Configurações
         const settings = await getSettings();
@@ -332,23 +332,21 @@ export const syncMetaCampaigns = async (clientId: string): Promise<{success: boo
         if (!clientDoc.exists()) return { success: false, message: "Cliente não encontrado." };
         
         const clientData = clientDoc.data() as UserProfile;
-        let accountId = clientData.adAccountId; // ex: act_123456
+        let accountId = clientData.adAccountId;
 
         if (!accountId) {
-            return { success: false, message: "Cliente sem ID de Conta de Anúncios. Edite o usuário e insira o ID (ex: act_123...)." };
+            return { success: false, message: "Cliente sem ID de Conta de Anúncios. Edite o usuário e insira o ID." };
         }
 
-        // CORREÇÃO AUTOMÁTICA DE ID
         accountId = accountId.trim();
         if (!accountId.startsWith('act_')) {
             accountId = `act_${accountId}`;
         }
 
-        // 3. Chamada REAL à API do Facebook (Graph API)
-        // Adicionamos 'objective' para ajudar a adivinhar o tipo de resultado
-        const apiUrl = `https://graph.facebook.com/v19.0/${accountId}/campaigns?fields=name,status,objective,insights{spend,impressions,clicks,cpc,ctr,action_values,actions,inline_link_clicks}&date_preset=maximum&use_account_attribution_setting=true&limit=200&access_token=${token}`;
+        // 3. Chamada REAL à API do Facebook (com filtro de data)
+        const apiUrl = `https://graph.facebook.com/v19.0/${accountId}/campaigns?fields=name,status,objective,insights{spend,impressions,clicks,cpc,ctr,action_values,actions,inline_link_clicks}&date_preset=${datePreset}&use_account_attribution_setting=true&limit=200&access_token=${token}`;
 
-        console.log(`[MetaSync] Buscando campanhas de: ${accountId}`);
+        console.log(`[MetaSync] Sync com preset: ${datePreset} | Conta: ${accountId}`);
         
         const response = await fetch(apiUrl);
         const data = await response.json();
@@ -358,87 +356,113 @@ export const syncMetaCampaigns = async (clientId: string): Promise<{success: boo
             return { success: false, message: `Erro Meta API: ${data.error.message}` };
         }
 
-        if (!data.data || data.data.length === 0) {
-            return { success: true, message: "Conexão bem sucedida, mas nenhuma campanha foi encontrada nesta conta." };
-        }
-
-        // 4. Processar e Salvar Dados
-        let newCount = 0;
+        // Se a chamada de insights voltar vazia para campanhas existentes (ex: sem gastos hoje), a API pode retornar a campanha sem insights ou nem retornar
+        // Se a API retornar [], significa que não houve atividade no período OU não tem campanhas.
+        
+        // 4. Processamento Inteligente de Eventos
         let updateCount = 0;
-
+        let newCount = 0;
+        
+        // Se estamos filtrando por data (ex: 'today'), as campanhas pausadas que não gastaram podem não vir.
+        // O ideal é buscar TODAS e atualizar. Se vier vazio, atualizamos para ZERO as métricas no DB (para refletir o dia).
+        
         const existingCampaigns = await getCampaigns(clientId);
+
+        // Se data.data vier vazio e estamos num preset curto (ex: today), pode ser que nada rodou hoje.
+        // Precisamos zerar os dados das campanhas ativas no DB para não mostrar dados velhos como se fossem de hoje.
+        if ((!data.data || data.data.length === 0) && datePreset !== 'maximum') {
+             const batch = writeBatch(db);
+             existingCampaigns.forEach(c => {
+                 batch.update(doc(db, CAMPAIGNS_COLLECTION, c.id), {
+                     spend: 0, impressions: 0, clicks: 0, ctr: 0, cpc: 0, roas: 0, conversations: 0, leads: 0
+                 });
+             });
+             await batch.commit();
+             return { success: true, message: `Sem dados para o período '${datePreset}'. Dashboard zerado.` };
+        }
 
         for (const item of data.data) {
             const insight = item.insights?.data?.[0] || {};
             const objective = item.objective || '';
+            const actions = insight.actions || [];
+            const actionValues = insight.action_values || [];
 
-            // Debug no console para o usuário ver o que está vindo
-            console.log(`[MetaSync] Campanha: ${item.name} | Objetivo: ${objective}`);
-            console.log(`[MetaSync] Ações RAW:`, insight.actions);
+            // --- A. BUCKETS DE EVENTOS ---
+            let officialConversations = 0;
+            let nativeLeads = 0;
+            let pixelLeads = 0;
+            let otherContacts = 0;
+            let linkClicks = Number(insight.inline_link_clicks || insight.clicks || 0);
 
-            // --- CÁLCULO DE RECEITA ---
+            actions.forEach((act: any) => {
+                const type = act.action_type;
+                const val = Number(act.value);
+
+                // 1. Conversas (Oficial)
+                if (type.includes('messaging_conversation_started')) {
+                    officialConversations += val;
+                }
+
+                // 2. Leads (Nativos - Formulário Facebook)
+                if (type === 'on_facebook_lead') {
+                    nativeLeads += val;
+                }
+
+                // 3. Leads (Pixel - Site)
+                if (type === 'lead' || type === 'offsite_conversion.fb_pixel_lead') {
+                    pixelLeads += val;
+                }
+
+                // 4. Outros Contatos (Agendamentos, Cadastros Genéricos)
+                if (type === 'contact' || type === 'schedule' || type === 'submit_application' || type === 'complete_registration') {
+                    otherContacts += val;
+                }
+            });
+
+            // --- B. LÓGICA DE ATRIBUIÇÃO E PRIORIDADE ---
+            let finalConversations = 0;
+            let finalLeads = 0;
+            let debugSource = "NENHUM";
+
+            // Leads: Soma tudo que é lead claro
+            finalLeads = nativeLeads + pixelLeads + otherContacts;
+
+            // Conversas: Sistema de Fallback
+            if (officialConversations > 0) {
+                // Cenário 1: Temos dados oficiais da API
+                finalConversations = officialConversations;
+                debugSource = "OFICIAL_API";
+            } else {
+                // Cenário 2: Sem dados oficiais. É campanha de tráfego/mensagem?
+                const isTrafficOrMessage = 
+                    objective.includes('TRAFFIC') || 
+                    objective.includes('MESSAGES') || 
+                    objective.includes('OUTCOME_TRAFFIC') || 
+                    objective.includes('LINK_CLICKS');
+                
+                if (isTrafficOrMessage && linkClicks > 0) {
+                    // Assumimos que o clique no link é a intenção de conversa (Estimado)
+                    finalConversations = linkClicks;
+                    debugSource = "ESTIMADO_CLIQUES (Fallback)";
+                }
+            }
+
+            console.groupCollapsed(`[MetaSync] ${item.name} (${datePreset})`);
+            console.log(`>>> Conversas: ${finalConversations} | Leads: ${finalLeads}`);
+            console.groupEnd();
+
+            // --- C. RECEITA ---
             let revenue = 0;
-            if (insight.action_values) {
-                const purchaseAction = insight.action_values.find((av: any) => 
-                    av.action_type === 'purchase' || 
-                    av.action_type === 'omni_purchase' ||
-                    av.action_type === 'offsite_conversion.fb_pixel_purchase'
-                );
-                if (purchaseAction) revenue = Number(purchaseAction.value);
-            }
-            
-            // --- MAPEAMENTO DE RESULTADOS (GRADE DE PESCA) ---
-            let conversations = 0;
-            let leads = 0;
+            const purchaseAction = actionValues.find((av: any) => 
+                av.action_type === 'purchase' || 
+                av.action_type === 'omni_purchase' ||
+                av.action_type === 'offsite_conversion.fb_pixel_purchase'
+            );
+            if (purchaseAction) revenue = Number(purchaseAction.value);
 
-            if (insight.actions) {
-                insight.actions.forEach((action: any) => {
-                    const type = action.action_type;
-                    const val = Number(action.value);
-
-                    // A. CONVERSAS (MENSAGENS)
-                    if (
-                        type.includes('messaging_conversation_started') ||
-                        type === 'onsite_conversion.messaging_conversation_started_7d'
-                    ) {
-                        conversations += val;
-                    }
-
-                    // B. LEADS & CADASTROS
-                    if (
-                        type === 'lead' || 
-                        type === 'offsite_conversion.fb_pixel_lead' || 
-                        type === 'on_facebook_lead' || // Form Nativo
-                        type === 'contact' ||
-                        type === 'submit_application' || 
-                        type === 'schedule' ||
-                        type === 'lead_grouped' ||
-                        type === 'mobile_app_install' // App Installs contam como "Leads" para métrica de volume
-                    ) {
-                        leads += val;
-                    }
-                });
-            }
-
-            // --- HEURÍSTICA DE TRÁFEGO PARA WHATSAPP ---
-            // Se a campanha é de tráfego/vendas, tem cliques no link, mas 0 conversas oficiais,
-            // muitas vezes a agência quer ver os Cliques no Link como "Conversas Iniciadas" (clique no link do zap)
-            const isTrafficObjective = objective.includes('TRAFFIC') || objective.includes('OUTCOME_TRAFFIC') || objective.includes('LINK_CLICKS');
-            const linkClicks = Number(insight.inline_link_clicks || insight.clicks || 0);
-
-            if (conversations === 0 && leads === 0 && isTrafficObjective && linkClicks > 0) {
-                // Opcional: Para não zerar o dashboard, assumimos cliques no link como "tentativa de conversa"
-                // Isso é polêmico, mas resolve o problema visual de "Campanha de Zap com 0 conversas"
-                // Descomente a linha abaixo se quiser forçar isso:
-                // conversations = linkClicks; 
-                console.log(`[MetaSync] Campanha de Tráfego sem conversas rastreadas. Cliques no link: ${linkClicks}`);
-            }
-
-            // Se ainda assim for zero, tenta pegar 'results' genérico se disponível (raro na API Graph padrão sem breakdown)
-            
+            // --- D. SALVAR ---
             const spend = Number(insight.spend || 0);
-            const roas = spend > 0 ? revenue / spend : 0;
-
+            
             const campaignData: Omit<Campaign, 'id'> = {
                 clientId: clientId,
                 externalId: item.id,
@@ -449,9 +473,9 @@ export const syncMetaCampaigns = async (clientId: string): Promise<{success: boo
                 clicks: Number(insight.clicks || 0),
                 ctr: Number(insight.ctr || 0) * 100,
                 cpc: Number(insight.cpc || 0),
-                roas: roas,
-                conversations: conversations,
-                leads: leads,
+                roas: spend > 0 ? revenue / spend : 0,
+                conversations: finalConversations,
+                leads: finalLeads,
                 platform: 'Meta'
             };
 
@@ -465,8 +489,21 @@ export const syncMetaCampaigns = async (clientId: string): Promise<{success: boo
                 newCount++;
             }
         }
+        
+        // IMPORTANTE: Campanhas que existem no DB mas NÃO vieram na API neste datePreset (ex: não rodaram hoje)
+        // devem ser zeradas se o preset não for 'maximum', para não misturar dados.
+        if (datePreset !== 'maximum') {
+            const returnedIds = data.data.map((d:any) => d.id);
+            const campaignsToZero = existingCampaigns.filter(c => !returnedIds.includes(c.externalId) && c.status === 'Active');
+            
+            for (const c of campaignsToZero) {
+                await updateDoc(doc(db, CAMPAIGNS_COLLECTION, c.id), {
+                     spend: 0, impressions: 0, clicks: 0, ctr: 0, cpc: 0, roas: 0, conversations: 0, leads: 0
+                });
+            }
+        }
 
-        return { success: true, message: `Sincronização concluída! Olhe o console (F12) para ver detalhes dos dados brutos.` };
+        return { success: true, message: `Sync concluído para período: ${datePreset}.` };
 
     } catch (error: any) {
         console.error(error);

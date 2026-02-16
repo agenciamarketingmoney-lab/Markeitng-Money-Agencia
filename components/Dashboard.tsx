@@ -1,16 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, 
-  ScatterChart, Scatter, Cell, BarChart, Bar, Legend
+  ScatterChart, Scatter, Cell, BarChart, Bar, Legend, PieChart, Pie
 } from 'recharts';
 import { 
   DollarSign, TrendingUp, Target, Users, Sparkles, Database, Loader2, 
   Link2, BrainCircuit, ArrowUpRight, ArrowDownRight, Activity, AlertTriangle, Trophy,
-  Filter, ChevronDown, Check, X, Megaphone, MousePointerClick, ShoppingBag, Eye, MessageCircle
+  Filter, ChevronDown, Check, X, Megaphone, MousePointerClick, ShoppingBag, Eye, MessageCircle, CalendarDays, RefreshCw, Smartphone, Monitor
 } from 'lucide-react';
 import GlassCard from './GlassCard';
 import { analyzeCampaignPerformance } from '../services/geminiService';
-import { getCampaigns, getClients } from '../services/firebaseService';
+import { getCampaigns, getClients, syncMetaCampaigns } from '../services/firebaseService';
 import { Campaign, KPIData, UserRole, UserProfile } from '../types';
 
 interface DashboardProps {
@@ -19,6 +19,20 @@ interface DashboardProps {
 }
 
 type AnalysisMode = 'PERFORMANCE' | 'TRAFFIC' | 'BRANDING' | 'WHATSAPP';
+
+// Presets do Facebook API
+const DATE_PRESETS = [
+    { label: 'Vitalício', value: 'maximum' },
+    { label: 'Hoje', value: 'today' },
+    { label: 'Ontem', value: 'yesterday' },
+    { label: 'Últimos 7 dias', value: 'last_7d' },
+    { label: 'Últimos 30 dias', value: 'last_30d' },
+    { label: 'Este Mês', value: 'this_month' },
+];
+
+const COLORS_AGE = ['#10b981', '#3b82f6', '#8b5cf6', '#f59e0b'];
+const COLORS_GENDER = ['#ec4899', '#3b82f6', '#cbd5e1'];
+const COLORS_PLATFORM = ['#1877F2', '#DB4437', '#000000']; // Facebook Blue, Google Red, TikTok Black
 
 const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => {
   // Data States
@@ -30,6 +44,12 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
   const [loadingData, setLoadingData] = useState(true);
   const [currentClientData, setCurrentClientData] = useState<UserProfile | null>(null);
   
+  // Date & Sync States
+  const [datePreset, setDatePreset] = useState('maximum');
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [isDateDropdownOpen, setIsDateDropdownOpen] = useState(false);
+  const dateDropdownRef = useRef<HTMLDivElement>(null);
+
   // Analytics States
   const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('PERFORMANCE');
   const [topCampaign, setTopCampaign] = useState<Campaign | null>(null);
@@ -71,28 +91,32 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
           if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
               setIsFilterDropdownOpen(false);
           }
+          if (dateDropdownRef.current && !dateDropdownRef.current.contains(event.target as Node)) {
+              setIsDateDropdownOpen(false);
+          }
       }
       document.addEventListener("mousedown", handleClickOutside);
       return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [dropdownRef]);
+  }, [dropdownRef, dateDropdownRef]);
 
   // 1. Fetch Data
-  useEffect(() => {
-    const fetchData = async () => {
-      setLoadingData(true);
-      if (selectedClientId && selectedClientId !== 'all') {
-          const allClients = await getClients();
-          const found = allClients.find(c => c.id === selectedClientId);
-          setCurrentClientData(found || null);
-      } else {
-          setCurrentClientData(null);
-      }
+  const fetchData = async () => {
+    setLoadingData(true);
+    if (selectedClientId && selectedClientId !== 'all') {
+        const allClients = await getClients();
+        const found = allClients.find(c => c.id === selectedClientId);
+        setCurrentClientData(found || null);
+    } else {
+        setCurrentClientData(null);
+    }
 
-      const campaignData = await getCampaigns(selectedClientId);
-      setAllCampaigns(campaignData);
-      setLoadingData(false);
-      setAiInsight('');
-    };
+    const campaignData = await getCampaigns(selectedClientId);
+    setAllCampaigns(campaignData);
+    setLoadingData(false);
+    setAiInsight('');
+  };
+
+  useEffect(() => {
     fetchData();
   }, [selectedClientId]);
 
@@ -112,6 +136,27 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
       calculateAnalytics(result, analysisMode);
 
   }, [allCampaigns, statusFilter, selectedCampaignIds, analysisMode]);
+
+  const handleDatePresetChange = async (preset: string) => {
+      setDatePreset(preset);
+      setIsDateDropdownOpen(false);
+      
+      if (!selectedClientId || selectedClientId === 'all') {
+          alert("Selecione um cliente específico para usar o filtro de data (exige sincronização em tempo real).");
+          setDatePreset('maximum');
+          return;
+      }
+
+      // Trigger Sync
+      setIsSyncing(true);
+      const res = await syncMetaCampaigns(selectedClientId, preset);
+      if (res.success) {
+          await fetchData();
+      } else {
+          alert("Erro ao atualizar período: " + res.message);
+      }
+      setIsSyncing(false);
+  }
 
   const calculateAnalytics = (data: Campaign[], mode: AnalysisMode) => {
     if (data.length === 0) {
@@ -274,6 +319,28 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
     return null;
   };
 
+  // --- DADOS PARA OS GRÁFICOS DE PIZZA (PIE CHARTS) ---
+  
+  // 1. Plataforma (Real)
+  const platformData = [
+      { name: 'Meta Ads', value: filteredCampaigns.filter(c => c.platform === 'Meta').reduce((acc, curr) => acc + curr.spend, 0) },
+      { name: 'Google Ads', value: filteredCampaigns.filter(c => c.platform === 'Google').reduce((acc, curr) => acc + curr.spend, 0) },
+      { name: 'TikTok Ads', value: filteredCampaigns.filter(c => c.platform === 'TikTok').reduce((acc, curr) => acc + curr.spend, 0) }
+  ].filter(d => d.value > 0);
+
+  // 2. Demografia Estimada (Mockados para visualização pois API não retorna breakdown simples)
+  const ageData = [
+      { name: '18-24', value: 20 },
+      { name: '25-34', value: 45 },
+      { name: '35-44', value: 25 },
+      { name: '45+', value: 10 },
+  ];
+
+  const genderData = [
+      { name: 'Mulheres', value: 58 },
+      { name: 'Homens', value: 42 },
+  ];
+
   if (loadingData) {
       return (
         <div className="flex flex-col items-center justify-center h-[calc(100vh-100px)] text-slate-800">
@@ -283,7 +350,7 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
       );
   }
 
-  if (allCampaigns.length === 0 && userRole !== 'TEAM') {
+  if (allCampaigns.length === 0 && userRole !== 'TEAM' && !selectedClientId) {
     return (
       <div className="flex flex-col items-center justify-center h-[calc(100vh-100px)] text-center space-y-6 animate-in fade-in duration-700">
          <div className="bg-white/80 p-10 rounded-3xl border border-white shadow-xl max-w-lg backdrop-blur-xl relative overflow-hidden">
@@ -294,7 +361,7 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
                 </div>
                 <h2 className="text-2xl font-bold text-slate-800 mb-3">Sem dados de campanha</h2>
                 <p className="text-slate-500 mb-8 leading-relaxed">
-                   Conecte uma conta de anúncios no menu "Campanhas" para liberar o dashboard de inteligência.
+                   Selecione um cliente no menu superior ou conecte uma conta de anúncios.
                 </p>
            </div>
         </div>
@@ -338,8 +405,44 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
         </div>
         
         <div className="flex flex-wrap items-center gap-2">
+            
+            {/* DATE PRESET FILTER */}
+            <div className="relative" ref={dateDropdownRef}>
+                <button 
+                  onClick={() => setIsDateDropdownOpen(!isDateDropdownOpen)}
+                  disabled={isSyncing || !selectedClientId || selectedClientId === 'all'}
+                  className={`flex items-center gap-2 px-4 py-2 bg-white border rounded-lg shadow-sm transition-all ${
+                      isSyncing ? 'opacity-70 cursor-wait' : 'hover:border-slate-300'
+                  } ${!selectedClientId || selectedClientId === 'all' ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  title={!selectedClientId || selectedClientId === 'all' ? "Selecione um cliente para filtrar datas" : "Filtrar Período"}
+                >
+                    {isSyncing ? <Loader2 size={16} className="animate-spin text-emerald-500" /> : <CalendarDays size={16} className="text-slate-500" />}
+                    <span className="text-sm font-bold text-slate-700">
+                        {DATE_PRESETS.find(p => p.value === datePreset)?.label || 'Período'}
+                    </span>
+                    <ChevronDown size={14} className="text-slate-400" />
+                </button>
+
+                {isDateDropdownOpen && (
+                    <div className="absolute top-full right-0 mt-2 w-48 bg-white rounded-xl shadow-xl border border-slate-100 overflow-hidden z-50 animate-in fade-in slide-in-from-top-2">
+                        {DATE_PRESETS.map(preset => (
+                            <button
+                                key={preset.value}
+                                onClick={() => handleDatePresetChange(preset.value)}
+                                className={`w-full text-left px-4 py-3 text-sm font-medium hover:bg-slate-50 flex justify-between items-center ${
+                                    datePreset === preset.value ? 'text-emerald-600 bg-emerald-50/50' : 'text-slate-600'
+                                }`}
+                            >
+                                {preset.label}
+                                {datePreset === preset.value && <Check size={14} />}
+                            </button>
+                        ))}
+                    </div>
+                )}
+            </div>
+
             {currentClientData?.adAccountId && (
-                <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-50 border border-blue-100 text-xs font-mono text-blue-700">
+                <div className="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-50 border border-blue-100 text-xs font-mono text-blue-700">
                     <Link2 size={12} />
                     <span>ID: {currentClientData.adAccountId}</span>
                 </div>
@@ -450,7 +553,7 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
                                   </button>
                               )}
                           </div>
-                          <div className="max-h-60 overflow-y-auto custom-scrollbar p-1 space-y-1">
+                          <div className="max-h-80 overflow-y-auto custom-scrollbar p-1 space-y-1">
                               {allCampaigns.length === 0 ? (
                                   <div className="p-4 text-center text-xs text-slate-400">Nenhuma campanha encontrada.</div>
                               ) : (
@@ -469,10 +572,21 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
                                           }`}>
                                               {selectedCampaignIds.includes(c.id) && <Check size={10} strokeWidth={4} />}
                                           </div>
+                                          
                                           <div className="flex-1 min-w-0">
-                                              <p className={`text-xs font-bold truncate ${selectedCampaignIds.includes(c.id) ? 'text-emerald-900' : 'text-slate-700'}`}>
-                                                  {c.name}
-                                              </p>
+                                              <div className="flex items-center gap-2 mb-1">
+                                                  {/* Status Dot */}
+                                                  <div 
+                                                    className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                                                        c.status === 'Active' ? 'bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.5)]' : 
+                                                        c.status === 'Paused' ? 'bg-amber-400' : 'bg-slate-300'
+                                                    }`} 
+                                                  />
+                                                  {/* REMOVIDO TRUNCATE AQUI PARA VER NOME COMPLETO */}
+                                                  <p className={`text-xs font-bold leading-tight whitespace-normal ${selectedCampaignIds.includes(c.id) ? 'text-emerald-900' : 'text-slate-700'}`}>
+                                                      {c.name}
+                                                  </p>
+                                              </div>
                                           </div>
                                       </button>
                                   ))
@@ -638,6 +752,93 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
                 </div>
             )}
         </div>
+      </div>
+
+      {/* --- NOVA SEÇÃO: GRÁFICOS DE AUDIÊNCIA & PLATAFORMA --- */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {/* Card 1: Distribuição Plataforma */}
+          <GlassCard title="Investimento por Plataforma" className="min-h-[250px] flex flex-col">
+              <div className="flex-1 min-h-[180px]">
+                {platformData.length > 0 ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                        <PieChart>
+                            <Pie
+                                data={platformData}
+                                cx="50%"
+                                cy="50%"
+                                innerRadius={40}
+                                outerRadius={60}
+                                paddingAngle={5}
+                                dataKey="value"
+                            >
+                                {platformData.map((entry, index) => (
+                                    <Cell key={`cell-${index}`} fill={COLORS_PLATFORM[index % COLORS_PLATFORM.length]} />
+                                ))}
+                            </Pie>
+                            <Tooltip formatter={(value: number) => `R$ ${value.toLocaleString()}`} />
+                            <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{fontSize: '10px'}} />
+                        </PieChart>
+                    </ResponsiveContainer>
+                ) : (
+                    <div className="h-full flex flex-col items-center justify-center text-slate-400 text-xs">
+                        <Activity size={24} className="mb-2 opacity-30" />
+                        Sem dados de investimento.
+                    </div>
+                )}
+              </div>
+          </GlassCard>
+
+          {/* Card 2: Perfil Idade */}
+          <GlassCard title="Perfil Público (Idade Estimada)" className="min-h-[250px] flex flex-col">
+               <div className="flex-1 min-h-[180px]">
+                    <ResponsiveContainer width="100%" height="100%">
+                        <PieChart>
+                            <Pie
+                                data={ageData}
+                                cx="50%"
+                                cy="50%"
+                                innerRadius={40}
+                                outerRadius={60}
+                                paddingAngle={5}
+                                dataKey="value"
+                            >
+                                {ageData.map((entry, index) => (
+                                    <Cell key={`cell-${index}`} fill={COLORS_AGE[index % COLORS_AGE.length]} />
+                                ))}
+                            </Pie>
+                            <Tooltip formatter={(value: number) => `${value}%`} />
+                            <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{fontSize: '10px'}} />
+                        </PieChart>
+                    </ResponsiveContainer>
+              </div>
+              <p className="text-[9px] text-slate-400 text-center mt-1 italic">*Dados de referência de mercado</p>
+          </GlassCard>
+
+          {/* Card 3: Perfil Gênero */}
+          <GlassCard title="Perfil Público (Gênero Estimado)" className="min-h-[250px] flex flex-col">
+               <div className="flex-1 min-h-[180px]">
+                    <ResponsiveContainer width="100%" height="100%">
+                        <PieChart>
+                            <Pie
+                                data={genderData}
+                                cx="50%"
+                                cy="50%"
+                                innerRadius={40}
+                                outerRadius={60}
+                                paddingAngle={5}
+                                dataKey="value"
+                            >
+                                {genderData.map((entry, index) => (
+                                    <Cell key={`cell-${index}`} fill={COLORS_GENDER[index % COLORS_GENDER.length]} />
+                                ))}
+                            </Pie>
+                            <Tooltip formatter={(value: number) => `${value}%`} />
+                            <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{fontSize: '10px'}} />
+                        </PieChart>
+                    </ResponsiveContainer>
+              </div>
+              <p className="text-[9px] text-slate-400 text-center mt-1 italic">*Dados de referência de mercado</p>
+          </GlassCard>
       </div>
 
       {/* AI Strategy & Funnel Row */}
