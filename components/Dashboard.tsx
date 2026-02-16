@@ -11,7 +11,7 @@ import {
 import GlassCard from './GlassCard';
 import { analyzeCampaignPerformance } from '../services/geminiService';
 import { getCampaigns, getClients, syncMetaCampaigns } from '../services/firebaseService';
-import { Campaign, KPIData, UserRole, UserProfile } from '../types';
+import { Campaign, KPIData, UserRole, UserProfile, BreakdownData } from '../types';
 
 interface DashboardProps {
     userRole: UserRole;
@@ -30,9 +30,9 @@ const DATE_PRESETS = [
     { label: 'Este Mês', value: 'this_month' },
 ];
 
-const COLORS_AGE = ['#10b981', '#3b82f6', '#8b5cf6', '#f59e0b'];
+const COLORS_AGE = ['#10b981', '#3b82f6', '#8b5cf6', '#f59e0b', '#ec4899', '#64748b'];
 const COLORS_GENDER = ['#ec4899', '#3b82f6', '#cbd5e1'];
-const COLORS_PLATFORM = ['#1877F2', '#DB4437', '#000000']; // Facebook Blue, Google Red, TikTok Black
+const COLORS_PLATFORM = ['#1877F2', '#E1306C', '#64748b', '#000000']; 
 
 const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => {
   // Data States
@@ -142,18 +142,28 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
       setIsDateDropdownOpen(false);
       
       if (!selectedClientId || selectedClientId === 'all') {
-          alert("Selecione um cliente específico para usar o filtro de data (exige sincronização em tempo real).");
+          alert("Selecione um cliente específico para usar o filtro de data.");
           setDatePreset('maximum');
           return;
       }
 
-      // Trigger Sync
+      // Auto-Sync ao mudar data
+      handleForceRefresh(preset);
+  }
+
+  const handleForceRefresh = async (presetToUse: string = datePreset) => {
+      if (!selectedClientId || selectedClientId === 'all') {
+          alert("Selecione um cliente para atualizar.");
+          return;
+      }
+      
       setIsSyncing(true);
-      const res = await syncMetaCampaigns(selectedClientId, preset);
+      const res = await syncMetaCampaigns(selectedClientId, presetToUse);
+      
       if (res.success) {
           await fetchData();
       } else {
-          alert("Erro ao atualizar período: " + res.message);
+          alert("Erro na atualização: " + res.message);
       }
       setIsSyncing(false);
   }
@@ -319,27 +329,39 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
     return null;
   };
 
-  // --- DADOS PARA OS GRÁFICOS DE PIZZA (PIE CHARTS) ---
-  
-  // 1. Plataforma (Real)
-  const platformData = [
-      { name: 'Meta Ads', value: filteredCampaigns.filter(c => c.platform === 'Meta').reduce((acc, curr) => acc + curr.spend, 0) },
-      { name: 'Google Ads', value: filteredCampaigns.filter(c => c.platform === 'Google').reduce((acc, curr) => acc + curr.spend, 0) },
-      { name: 'TikTok Ads', value: filteredCampaigns.filter(c => c.platform === 'TikTok').reduce((acc, curr) => acc + curr.spend, 0) }
-  ].filter(d => d.value > 0);
+  // --- PRECISÃO TOTAL: SOMA DE BREAKDOWNS FILTRADOS ---
+  const calculateBreakdownSum = (field: 'ageBreakdown' | 'genderBreakdown' | 'platformBreakdown') => {
+      const summary: Record<string, number> = {};
+      
+      filteredCampaigns.forEach(campaign => {
+          if (campaign[field]) {
+              Object.entries(campaign[field] as BreakdownData).forEach(([key, value]) => {
+                  let displayKey = key;
+                  if (field === 'genderBreakdown') {
+                      if (key === 'female') displayKey = 'Mulheres';
+                      if (key === 'male') displayKey = 'Homens';
+                      if (key === 'unknown') displayKey = 'Desconhecido';
+                  }
+                  if (field === 'platformBreakdown') {
+                      if (key === 'facebook') displayKey = 'Facebook';
+                      if (key === 'instagram') displayKey = 'Instagram';
+                      if (key === 'audience_network') displayKey = 'Audience Net.';
+                      if (key === 'messenger') displayKey = 'Messenger';
+                  }
 
-  // 2. Demografia Estimada (Mockados para visualização pois API não retorna breakdown simples)
-  const ageData = [
-      { name: '18-24', value: 20 },
-      { name: '25-34', value: 45 },
-      { name: '35-44', value: 25 },
-      { name: '45+', value: 10 },
-  ];
+                  summary[displayKey] = (summary[displayKey] || 0) + value;
+              });
+          }
+      });
 
-  const genderData = [
-      { name: 'Mulheres', value: 58 },
-      { name: 'Homens', value: 42 },
-  ];
+      return Object.entries(summary)
+        .map(([name, value]) => ({ name, value }))
+        .sort((a, b) => b.value - a.value); // Ordenar por maior valor
+  };
+
+  const platformData = calculateBreakdownSum('platformBreakdown');
+  const ageData = calculateBreakdownSum('ageBreakdown');
+  const genderData = calculateBreakdownSum('genderBreakdown');
 
   if (loadingData) {
       return (
@@ -406,6 +428,18 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
         
         <div className="flex flex-wrap items-center gap-2">
             
+            {/* FORCE REFRESH BUTTON */}
+            {selectedClientId && selectedClientId !== 'all' && (
+                <button
+                    onClick={() => handleForceRefresh()}
+                    disabled={isSyncing}
+                    className="flex items-center justify-center p-2 bg-white border border-slate-200 rounded-lg text-slate-500 hover:text-emerald-600 hover:border-emerald-300 transition-all shadow-sm disabled:opacity-50"
+                    title="Forçar Atualização do Facebook"
+                >
+                    <RefreshCw size={16} className={isSyncing ? "animate-spin" : ""} />
+                </button>
+            )}
+
             {/* DATE PRESET FILTER */}
             <div className="relative" ref={dateDropdownRef}>
                 <button 
@@ -757,7 +791,7 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
       {/* --- NOVA SEÇÃO: GRÁFICOS DE AUDIÊNCIA & PLATAFORMA --- */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {/* Card 1: Distribuição Plataforma */}
-          <GlassCard title="Investimento por Plataforma" className="min-h-[250px] flex flex-col">
+          <GlassCard title="Investimento por Plataforma (Real)" className="min-h-[250px] flex flex-col">
               <div className="flex-1 min-h-[180px]">
                 {platformData.length > 0 ? (
                     <ResponsiveContainer width="100%" height="100%">
@@ -775,69 +809,81 @@ const Dashboard: React.FC<DashboardProps> = ({ userRole, selectedClientId }) => 
                                     <Cell key={`cell-${index}`} fill={COLORS_PLATFORM[index % COLORS_PLATFORM.length]} />
                                 ))}
                             </Pie>
-                            <Tooltip formatter={(value: number) => `R$ ${value.toLocaleString()}`} />
+                            <Tooltip formatter={(value: number) => `R$ ${value.toLocaleString('pt-BR', {minimumFractionDigits: 2})}`} />
                             <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{fontSize: '10px'}} />
                         </PieChart>
                     </ResponsiveContainer>
                 ) : (
                     <div className="h-full flex flex-col items-center justify-center text-slate-400 text-xs">
                         <Activity size={24} className="mb-2 opacity-30" />
-                        Sem dados de investimento.
+                        Sem dados de investimento para o filtro selecionado.
                     </div>
                 )}
               </div>
           </GlassCard>
 
           {/* Card 2: Perfil Idade */}
-          <GlassCard title="Perfil Público (Idade Estimada)" className="min-h-[250px] flex flex-col">
+          <GlassCard title="Perfil Público (Idade Real)" className="min-h-[250px] flex flex-col">
                <div className="flex-1 min-h-[180px]">
-                    <ResponsiveContainer width="100%" height="100%">
-                        <PieChart>
-                            <Pie
-                                data={ageData}
-                                cx="50%"
-                                cy="50%"
-                                innerRadius={40}
-                                outerRadius={60}
-                                paddingAngle={5}
-                                dataKey="value"
-                            >
-                                {ageData.map((entry, index) => (
-                                    <Cell key={`cell-${index}`} fill={COLORS_AGE[index % COLORS_AGE.length]} />
-                                ))}
-                            </Pie>
-                            <Tooltip formatter={(value: number) => `${value}%`} />
-                            <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{fontSize: '10px'}} />
-                        </PieChart>
-                    </ResponsiveContainer>
+                    {ageData.length > 0 ? (
+                        <ResponsiveContainer width="100%" height="100%">
+                            <PieChart>
+                                <Pie
+                                    data={ageData}
+                                    cx="50%"
+                                     cy="50%"
+                                    innerRadius={40}
+                                    outerRadius={60}
+                                    paddingAngle={5}
+                                    dataKey="value"
+                                >
+                                    {ageData.map((entry, index) => (
+                                        <Cell key={`cell-${index}`} fill={COLORS_AGE[index % COLORS_AGE.length]} />
+                                    ))}
+                                </Pie>
+                                <Tooltip formatter={(value: number) => value.toLocaleString()} />
+                                <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{fontSize: '10px'}} />
+                            </PieChart>
+                        </ResponsiveContainer>
+                    ) : (
+                        <div className="h-full flex flex-col items-center justify-center text-slate-400 text-xs">
+                            <Users size={24} className="mb-2 opacity-30" />
+                            Sem dados demográficos.
+                        </div>
+                    )}
               </div>
-              <p className="text-[9px] text-slate-400 text-center mt-1 italic">*Dados de referência de mercado</p>
           </GlassCard>
 
           {/* Card 3: Perfil Gênero */}
-          <GlassCard title="Perfil Público (Gênero Estimado)" className="min-h-[250px] flex flex-col">
+          <GlassCard title="Perfil Público (Gênero Real)" className="min-h-[250px] flex flex-col">
                <div className="flex-1 min-h-[180px]">
-                    <ResponsiveContainer width="100%" height="100%">
-                        <PieChart>
-                            <Pie
-                                data={genderData}
-                                cx="50%"
-                                cy="50%"
-                                innerRadius={40}
-                                outerRadius={60}
-                                paddingAngle={5}
-                                dataKey="value"
-                            >
-                                {genderData.map((entry, index) => (
-                                    <Cell key={`cell-${index}`} fill={COLORS_GENDER[index % COLORS_GENDER.length]} />
-                                ))}
-                            </Pie>
-                            <Tooltip formatter={(value: number) => `${value}%`} />
-                            <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{fontSize: '10px'}} />
-                        </PieChart>
-                    </ResponsiveContainer>
+                    {genderData.length > 0 ? (
+                        <ResponsiveContainer width="100%" height="100%">
+                            <PieChart>
+                                <Pie
+                                    data={genderData}
+                                    cx="50%"
+                                    cy="50%"
+                                    innerRadius={40}
+                                    outerRadius={60}
+                                    paddingAngle={5}
+                                    dataKey="value"
+                                >
+                                    {genderData.map((entry, index) => (
+                                        <Cell key={`cell-${index}`} fill={COLORS_GENDER[index % COLORS_GENDER.length]} />
+                                    ))}
+                                </Pie>
+                                <Tooltip formatter={(value: number) => value.toLocaleString()} />
+                                <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{fontSize: '10px'}} />
+                            </PieChart>
+                        </ResponsiveContainer>
+                    ) : (
+                        <div className="h-full flex flex-col items-center justify-center text-slate-400 text-xs">
+                            <Users size={24} className="mb-2 opacity-30" />
+                            Sem dados demográficos.
+                        </div>
+                    )}
               </div>
-              <p className="text-[9px] text-slate-400 text-center mt-1 italic">*Dados de referência de mercado</p>
           </GlassCard>
       </div>
 

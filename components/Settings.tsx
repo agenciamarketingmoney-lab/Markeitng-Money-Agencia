@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Save, Lock, Facebook, Key, Loader2, CheckCircle2, ShieldCheck, ExternalLink, HelpCircle, AlertTriangle, ChevronDown, ChevronUp, Zap, XCircle, Trash2, Database } from 'lucide-react';
+import { Save, Lock, Facebook, Key, Loader2, CheckCircle2, ShieldCheck, ExternalLink, HelpCircle, AlertTriangle, ChevronDown, ChevronUp, Zap, XCircle, Trash2, Database, Eraser } from 'lucide-react';
 import GlassCard from './GlassCard';
-import { getSettings, saveSettings, validateMetaToken, resetDemoData } from '../services/firebaseService';
+import { getSettings, saveSettings, validateMetaToken, resetDemoData, clearAllCampaigns } from '../services/firebaseService';
 
 const Settings: React.FC = () => {
     const [metaToken, setMetaToken] = useState('');
@@ -10,6 +10,7 @@ const Settings: React.FC = () => {
     const [success, setSuccess] = useState(false);
     const [showHelp, setShowHelp] = useState(false);
     const [resetting, setResetting] = useState(false);
+    const [clearing, setClearing] = useState(false);
     
     // Test States
     const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
@@ -60,17 +61,36 @@ const Settings: React.FC = () => {
     };
 
     const handleResetDemo = async () => {
-        if (!confirm("Tem certeza? Isso APAGARÁ todas as campanhas e tarefas existentes e recriará os dados de exemplo. Use apenas para limpar o sistema.")) return;
+        if (!confirm("Tem certeza? Isso APAGARÁ todas as campanhas e tarefas existentes e recriará os dados de exemplo.")) return;
         
         setResetting(true);
         const res = await resetDemoData();
         setResetting(false);
         
         if (res.success) {
-            alert("Dados resetados com sucesso! O dashboard agora mostrará as métricas de WhatsApp.");
+            alert("Dados de DEMONSTRAÇÃO restaurados com sucesso.");
             window.location.reload();
         } else {
             alert("Erro ao resetar: " + res.message);
+        }
+    }
+
+    const handleClearCampaigns = async () => {
+        if (!confirm("⚠️ ATENÇÃO: Isso apagará TODAS as campanhas do banco de dados (Zero Absoluto). \n\nFaça isso se você quiser sincronizar o Meta Ads do zero para evitar duplicação ou dados fantasmas.")) return;
+        
+        setClearing(true);
+        
+        // Limpar LocalStorage também para garantir que não haja caches de filtro
+        window.localStorage.clear();
+        
+        const res = await clearAllCampaigns();
+        setClearing(false);
+
+        if (res.success) {
+            alert(res.message + "\n\nA página será recarregada automaticamente para garantir a limpeza total.");
+            window.location.reload();
+        } else {
+            alert("Erro: " + res.message);
         }
     }
 
@@ -221,23 +241,49 @@ const Settings: React.FC = () => {
             </GlassCard>
 
             <GlassCard title="Zona de Perigo" className="border-t-4 border-t-red-500">
-                <div className="flex items-start gap-4">
-                    <div className="p-3 bg-red-50 text-red-600 rounded-lg">
-                        <Database size={24} />
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                     <div className="bg-red-50/50 p-4 rounded-xl border border-red-100">
+                        <div className="flex items-start gap-3">
+                            <div className="p-2 bg-red-100 text-red-600 rounded-lg shrink-0">
+                                <Eraser size={20} />
+                            </div>
+                            <div>
+                                <h4 className="text-slate-800 font-bold text-sm">Limpar Banco de Campanhas</h4>
+                                <p className="text-xs text-slate-500 mt-1 mb-3 leading-relaxed">
+                                    Apaga TODAS as campanhas salvas. Use isso se os dados estiverem inconsistentes (fantasmas, valores errados) para permitir uma sincronização limpa do Meta.
+                                </p>
+                                <button 
+                                    onClick={handleClearCampaigns}
+                                    disabled={clearing}
+                                    className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-white border border-red-200 text-red-600 rounded-lg text-xs font-bold hover:bg-red-500 hover:text-white hover:border-red-500 transition-all shadow-sm disabled:opacity-50"
+                                >
+                                    {clearing ? <Loader2 size={12} className="animate-spin"/> : <Eraser size={12} />}
+                                    {clearing ? 'Excluindo tudo...' : 'Limpar Campanhas (Zero)'}
+                                </button>
+                            </div>
+                        </div>
                     </div>
-                    <div>
-                        <h4 className="text-slate-800 font-bold">Resetar Dados de Demo</h4>
-                        <p className="text-sm text-slate-500 mt-1 mb-3">
-                            Isso apagará todas as campanhas fictícias atuais e criará novas com as métricas de WhatsApp/Leads corrigidas.
-                        </p>
-                        <button 
-                            onClick={handleResetDemo}
-                            disabled={resetting}
-                            className="flex items-center gap-2 px-4 py-2 bg-white border border-red-200 text-red-600 rounded-lg text-sm font-bold hover:bg-red-50 hover:border-red-300 transition-colors shadow-sm disabled:opacity-50"
-                        >
-                            {resetting ? <Loader2 size={14} className="animate-spin"/> : <Trash2 size={14} />}
-                            Resetar Banco de Dados
-                        </button>
+
+                    <div className="bg-slate-50/50 p-4 rounded-xl border border-slate-200">
+                        <div className="flex items-start gap-3">
+                            <div className="p-2 bg-slate-200 text-slate-600 rounded-lg shrink-0">
+                                <Database size={20} />
+                            </div>
+                            <div>
+                                <h4 className="text-slate-800 font-bold text-sm">Restaurar Dados de Demo</h4>
+                                <p className="text-xs text-slate-500 mt-1 mb-3 leading-relaxed">
+                                    Apaga tudo e preenche com dados fictícios para teste. Útil para demonstrações de venda do software.
+                                </p>
+                                <button 
+                                    onClick={handleResetDemo}
+                                    disabled={resetting}
+                                    className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-white border border-slate-300 text-slate-600 rounded-lg text-xs font-bold hover:bg-slate-800 hover:text-white hover:border-slate-800 transition-all shadow-sm disabled:opacity-50"
+                                >
+                                    {resetting ? <Loader2 size={12} className="animate-spin"/> : <Trash2 size={12} />}
+                                    Resetar para Demo
+                                </button>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </GlassCard>

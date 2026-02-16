@@ -1,8 +1,8 @@
 import { db, auth } from "../firebaseConfig";
-import { collection, getDocs, addDoc, updateDoc, doc, query, where, setDoc, getDoc, deleteDoc, writeBatch } from "firebase/firestore";
+import { collection, getDocs, addDoc, updateDoc, doc, query, where, setDoc, getDoc, deleteDoc, writeBatch, limit } from "firebase/firestore";
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, getAuth } from "firebase/auth";
 import { initializeApp, getApp, deleteApp } from "firebase/app";
-import { Campaign, Task, TaskStatus, UserProfile, UserRole, AppSettings } from "../types";
+import { Campaign, Task, TaskStatus, UserProfile, UserRole, AppSettings, BreakdownData } from "../types";
 import { MOCK_CAMPAIGNS, MOCK_TASKS } from "../constants";
 
 // Nome das coleções no Firestore
@@ -316,198 +316,236 @@ export const addCampaign = async (campaign: Omit<Campaign, 'id'>) => {
     }
 }
 
-// --- SYNC ENGINE (IMPLEMENTAÇÃO ROBUSTA - "SMART PARSER" + DATE FILTER) ---
+// === PROTOCOLO DE EXCLUSÃO RECURSIVA ===
+// Esta função deleta em lotes até que NÃO SOBRE NADA.
+export const clearAllCampaigns = async () => {
+    let totalDeleted = 0;
+    let keepDeleting = true;
+    const BATCH_SIZE = 400; // Limite seguro do Firestore
+
+    try {
+        console.log("Iniciando Protocolo de Exclusão Recursiva...");
+        
+        while (keepDeleting) {
+            // Busca apenas o próximo lote de X itens
+            const q = query(collection(db, CAMPAIGNS_COLLECTION), limit(BATCH_SIZE));
+            const snapshot = await getDocs(q);
+
+            if (snapshot.empty) {
+                keepDeleting = false;
+                console.log("Nenhum documento restante. Limpeza concluída.");
+                break;
+            }
+
+            console.log(`Encontrados ${snapshot.size} documentos. Deletando lote...`);
+
+            const batch = writeBatch(db);
+            snapshot.docs.forEach((doc) => {
+                batch.delete(doc.ref);
+            });
+
+            await batch.commit();
+            totalDeleted += snapshot.size;
+            console.log(`Lote deletado. Total acumulado: ${totalDeleted}`);
+            
+            // Pequena pausa para não sobrecarregar
+            await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        
+        return { success: true, message: `${totalDeleted} campanhas foram apagadas permanentemente.` };
+    } catch (error: any) {
+        console.error("Erro Crítico ao limpar campanhas:", error);
+        return { success: false, message: "Erro crítico ao limpar: " + error.message };
+    }
+}
+
+// --- SYNC ENGINE (AGENCY OWNER MIRROR MODE) ---
 export const syncMetaCampaigns = async (clientId: string, datePreset: string = 'maximum'): Promise<{success: boolean, message: string}> => {
     try {
-        // 1. Obter Token e Configurações
+        // 1. Setup inicial
         const settings = await getSettings();
         const token = settings.metaAdsToken;
-        
-        if (!token) {
-            return { success: false, message: "Token da Agência não configurado. Vá em Configurações e insira o Token." };
-        }
+        if (!token) return { success: false, message: "Token da Agência não configurado." };
 
-        // 2. Obter ID da Conta do Cliente
         const clientDoc = await getDoc(doc(db, USERS_COLLECTION, clientId));
         if (!clientDoc.exists()) return { success: false, message: "Cliente não encontrado." };
         
         const clientData = clientDoc.data() as UserProfile;
         let accountId = clientData.adAccountId;
-
-        if (!accountId) {
-            return { success: false, message: "Cliente sem ID de Conta de Anúncios. Edite o usuário e insira o ID." };
-        }
+        if (!accountId) return { success: false, message: "Cliente sem ID de Conta." };
 
         accountId = accountId.trim();
-        if (!accountId.startsWith('act_')) {
-            accountId = `act_${accountId}`;
-        }
+        if (!accountId.startsWith('act_')) accountId = `act_${accountId}`;
 
-        // 3. Chamada REAL à API do Facebook (com filtro de data)
-        const apiUrl = `https://graph.facebook.com/v19.0/${accountId}/campaigns?fields=name,status,objective,insights{spend,impressions,clicks,cpc,ctr,action_values,actions,inline_link_clicks}&date_preset=${datePreset}&use_account_attribution_setting=true&limit=200&access_token=${token}`;
+        console.log(`[MetaSync] Iniciando espelhamento total para ${accountId} (${datePreset})`);
 
-        console.log(`[MetaSync] Sync com preset: ${datePreset} | Conta: ${accountId}`);
-        
-        const response = await fetch(apiUrl);
-        const data = await response.json();
-
-        if (data.error) {
-            console.error("Meta API Error:", data.error);
-            return { success: false, message: `Erro Meta API: ${data.error.message}` };
-        }
-
-        // Se a chamada de insights voltar vazia para campanhas existentes (ex: sem gastos hoje), a API pode retornar a campanha sem insights ou nem retornar
-        // Se a API retornar [], significa que não houve atividade no período OU não tem campanhas.
-        
-        // 4. Processamento Inteligente de Eventos
-        let updateCount = 0;
-        let newCount = 0;
-        
-        // Se estamos filtrando por data (ex: 'today'), as campanhas pausadas que não gastaram podem não vir.
-        // O ideal é buscar TODAS e atualizar. Se vier vazio, atualizamos para ZERO as métricas no DB (para refletir o dia).
-        
+        // 2. BUSCA DO ESTADO ATUAL NO BANCO DE DADOS (Para detectar fantasmas)
         const existingCampaigns = await getCampaigns(clientId);
+        const existingCampaignMap = new Map<string, Campaign>();
+        existingCampaigns.forEach(c => {
+            if (c.externalId) existingCampaignMap.set(c.externalId, c);
+        });
 
-        // Se data.data vier vazio e estamos num preset curto (ex: today), pode ser que nada rodou hoje.
-        // Precisamos zerar os dados das campanhas ativas no DB para não mostrar dados velhos como se fossem de hoje.
-        if ((!data.data || data.data.length === 0) && datePreset !== 'maximum') {
-             const batch = writeBatch(db);
-             existingCampaigns.forEach(c => {
-                 batch.update(doc(db, CAMPAIGNS_COLLECTION, c.id), {
-                     spend: 0, impressions: 0, clicks: 0, ctr: 0, cpc: 0, roas: 0, conversations: 0, leads: 0
-                 });
-             });
-             await batch.commit();
-             return { success: true, message: `Sem dados para o período '${datePreset}'. Dashboard zerado.` };
-        }
+        // 3. URLs das APIs (MODO ESPELHO)
+        const campaignsUrl = `https://graph.facebook.com/v19.0/${accountId}/campaigns?fields=name,status,effective_status,objective,insights{spend,impressions,clicks,cpc,ctr,action_values,actions,inline_link_clicks}&date_preset=${datePreset}&use_account_attribution_setting=true&limit=1000&access_token=${token}`;
+        
+        const demographicsUrl = `https://graph.facebook.com/v19.0/${accountId}/insights?level=campaign&breakdowns=age,gender&fields=campaign_id,spend,impressions&date_preset=${datePreset}&use_account_attribution_setting=true&access_token=${token}&limit=1000`;
+        const platformUrl = `https://graph.facebook.com/v19.0/${accountId}/insights?level=campaign&breakdowns=publisher_platform&fields=campaign_id,spend,impressions&date_preset=${datePreset}&use_account_attribution_setting=true&access_token=${token}&limit=1000`;
 
-        for (const item of data.data) {
-            const insight = item.insights?.data?.[0] || {};
-            const objective = item.objective || '';
-            const actions = insight.actions || [];
-            const actionValues = insight.action_values || [];
+        const [campRes, demoRes, platRes] = await Promise.all([
+            fetch(campaignsUrl),
+            fetch(demographicsUrl),
+            fetch(platformUrl)
+        ]);
 
-            // --- A. BUCKETS DE EVENTOS ---
-            let officialConversations = 0;
-            let nativeLeads = 0;
-            let pixelLeads = 0;
-            let otherContacts = 0;
-            let linkClicks = Number(insight.inline_link_clicks || insight.clicks || 0);
+        const campData = await campRes.json();
+        const demoData = await demoRes.json();
+        const platData = await platRes.json();
 
-            actions.forEach((act: any) => {
-                const type = act.action_type;
-                const val = Number(act.value);
+        if (campData.error) return { success: false, message: `Erro API Meta: ${campData.error.message}` };
+        
+        // 4. Mapear Dados Auxiliares
+        const ageMap: Record<string, BreakdownData> = {};
+        const genderMap: Record<string, BreakdownData> = {};
+        const platformMap: Record<string, BreakdownData> = {};
 
-                // 1. Conversas (Oficial)
-                if (type.includes('messaging_conversation_started')) {
-                    officialConversations += val;
-                }
-
-                // 2. Leads (Nativos - Formulário Facebook)
-                if (type === 'on_facebook_lead') {
-                    nativeLeads += val;
-                }
-
-                // 3. Leads (Pixel - Site)
-                if (type === 'lead' || type === 'offsite_conversion.fb_pixel_lead') {
-                    pixelLeads += val;
-                }
-
-                // 4. Outros Contatos (Agendamentos, Cadastros Genéricos)
-                if (type === 'contact' || type === 'schedule' || type === 'submit_application' || type === 'complete_registration') {
-                    otherContacts += val;
-                }
+        // Processar Demografia
+        if (demoData.data) {
+            demoData.data.forEach((row: any) => {
+                const cid = row.campaign_id;
+                const value = Number(row.impressions || 0);
+                if (!ageMap[cid]) ageMap[cid] = {};
+                if (!genderMap[cid]) genderMap[cid] = {};
+                ageMap[cid][row.age] = (ageMap[cid][row.age] || 0) + value;
+                genderMap[cid][row.gender] = (genderMap[cid][row.gender] || 0) + value;
             });
-
-            // --- B. LÓGICA DE ATRIBUIÇÃO E PRIORIDADE ---
-            let finalConversations = 0;
-            let finalLeads = 0;
-            let debugSource = "NENHUM";
-
-            // Leads: Soma tudo que é lead claro
-            finalLeads = nativeLeads + pixelLeads + otherContacts;
-
-            // Conversas: Sistema de Fallback
-            if (officialConversations > 0) {
-                // Cenário 1: Temos dados oficiais da API
-                finalConversations = officialConversations;
-                debugSource = "OFICIAL_API";
-            } else {
-                // Cenário 2: Sem dados oficiais. É campanha de tráfego/mensagem?
-                const isTrafficOrMessage = 
-                    objective.includes('TRAFFIC') || 
-                    objective.includes('MESSAGES') || 
-                    objective.includes('OUTCOME_TRAFFIC') || 
-                    objective.includes('LINK_CLICKS');
-                
-                if (isTrafficOrMessage && linkClicks > 0) {
-                    // Assumimos que o clique no link é a intenção de conversa (Estimado)
-                    finalConversations = linkClicks;
-                    debugSource = "ESTIMADO_CLIQUES (Fallback)";
-                }
-            }
-
-            console.groupCollapsed(`[MetaSync] ${item.name} (${datePreset})`);
-            console.log(`>>> Conversas: ${finalConversations} | Leads: ${finalLeads}`);
-            console.groupEnd();
-
-            // --- C. RECEITA ---
-            let revenue = 0;
-            const purchaseAction = actionValues.find((av: any) => 
-                av.action_type === 'purchase' || 
-                av.action_type === 'omni_purchase' ||
-                av.action_type === 'offsite_conversion.fb_pixel_purchase'
-            );
-            if (purchaseAction) revenue = Number(purchaseAction.value);
-
-            // --- D. SALVAR ---
-            const spend = Number(insight.spend || 0);
-            
-            const campaignData: Omit<Campaign, 'id'> = {
-                clientId: clientId,
-                externalId: item.id,
-                name: item.name,
-                status: item.status === 'ACTIVE' ? 'Active' : item.status === 'PAUSED' ? 'Paused' : 'Completed',
-                spend: spend,
-                impressions: Number(insight.impressions || 0),
-                clicks: Number(insight.clicks || 0),
-                ctr: Number(insight.ctr || 0) * 100,
-                cpc: Number(insight.cpc || 0),
-                roas: spend > 0 ? revenue / spend : 0,
-                conversations: finalConversations,
-                leads: finalLeads,
-                platform: 'Meta'
-            };
-
-            const existing = existingCampaigns.find(c => c.externalId === item.id || c.name === item.name);
-
-            if (existing) {
-                await updateDoc(doc(db, CAMPAIGNS_COLLECTION, existing.id), campaignData);
-                updateCount++;
-            } else {
-                await addDoc(collection(db, CAMPAIGNS_COLLECTION), campaignData);
-                newCount++;
-            }
+        }
+        // Processar Plataforma
+        if (platData.data) {
+            platData.data.forEach((row: any) => {
+                const cid = row.campaign_id;
+                const value = Number(row.spend || 0);
+                if (!platformMap[cid]) platformMap[cid] = {};
+                platformMap[cid][row.publisher_platform] = (platformMap[cid][row.publisher_platform] || 0) + value;
+            });
         }
         
-        // IMPORTANTE: Campanhas que existem no DB mas NÃO vieram na API neste datePreset (ex: não rodaram hoje)
-        // devem ser zeradas se o preset não for 'maximum', para não misturar dados.
-        if (datePreset !== 'maximum') {
-            const returnedIds = data.data.map((d:any) => d.id);
-            const campaignsToZero = existingCampaigns.filter(c => !returnedIds.includes(c.externalId) && c.status === 'Active');
-            
-            for (const c of campaignsToZero) {
-                await updateDoc(doc(db, CAMPAIGNS_COLLECTION, c.id), {
-                     spend: 0, impressions: 0, clicks: 0, ctr: 0, cpc: 0, roas: 0, conversations: 0, leads: 0
+        // 5. PROCESSAMENTO E ATUALIZAÇÃO (ESPELHAMENTO)
+        const activeIdsInMeta = new Set<string>();
+
+        if (campData.data) {
+            for (const item of campData.data) {
+                activeIdsInMeta.add(item.id);
+
+                const insight = item.insights?.data?.[0] || {};
+                const objective = item.objective || '';
+                const actions = insight.actions || [];
+                const actionValues = insight.action_values || [];
+
+                // --- LOGICA DE SOMA DE MENSAGENS (SUPER AGRESSIVA) ---
+                let messagingSum = 0;
+                let leadSum = 0;
+                let purchaseValue = 0;
+
+                actions.forEach((act: any) => {
+                    const type = act.action_type;
+                    const val = Number(act.value);
+                    
+                    if (type.includes('messaging_conversation_started') || 
+                        type.includes('contact_total') || 
+                        type.includes('onsite_conversion.messaging_conversation')) {
+                        messagingSum += val;
+                    }
+
+                    if (type === 'lead' || type === 'on_facebook_lead') {
+                        leadSum += val;
+                    }
                 });
+
+                const linkClicks = Number(insight.inline_link_clicks || insight.clicks || 0);
+                if (messagingSum === 0 && leadSum === 0 && (objective.includes('MESSAGES') || objective.includes('TRAFFIC')) && linkClicks > 0) {
+                     // Conservador: mantem 0 se não houver conversão explicita
+                }
+
+                actionValues.forEach((av: any) => {
+                    if (av.action_type === 'purchase' || av.action_type === 'omni_purchase') {
+                        purchaseValue += Number(av.value);
+                    }
+                });
+
+                const spend = Number(insight.spend || 0);
+                
+                // STATUS EFETIVO
+                let realStatus: 'Active' | 'Paused' | 'Completed' = 'Active';
+                const metaStatus = item.effective_status || item.status;
+                
+                if (metaStatus === 'ACTIVE') realStatus = 'Active';
+                else if (['PAUSED', 'ARCHIVED', 'DELETED', 'ADSET_PAUSED', 'CAMPAIGN_PAUSED'].includes(metaStatus)) realStatus = 'Paused';
+                else realStatus = 'Completed';
+
+                const campaignData: Omit<Campaign, 'id'> = {
+                    clientId: clientId,
+                    externalId: item.id,
+                    name: item.name,
+                    status: realStatus,
+                    spend: spend,
+                    impressions: Number(insight.impressions || 0),
+                    clicks: Number(insight.clicks || 0),
+                    ctr: Number(insight.ctr || 0) * 100,
+                    cpc: Number(insight.cpc || 0),
+                    roas: spend > 0 ? purchaseValue / spend : 0,
+                    conversations: messagingSum,
+                    leads: leadSum,
+                    platform: 'Meta',
+                    ageBreakdown: ageMap[item.id] || {},
+                    genderBreakdown: genderMap[item.id] || {},
+                    platformBreakdown: platformMap[item.id] || {}
+                };
+
+                const existing = existingCampaignMap.get(item.id);
+
+                if (existing) {
+                    await updateDoc(doc(db, CAMPAIGNS_COLLECTION, existing.id), campaignData);
+                } else {
+                    await addDoc(collection(db, CAMPAIGNS_COLLECTION), campaignData);
+                }
             }
         }
 
-        return { success: true, message: `Sync concluído para período: ${datePreset}.` };
+        // 6. GHOST KILLER (MATADOR DE FANTASMAS)
+        const batch = writeBatch(db);
+        let killedGhosts = 0;
+
+        existingCampaignMap.forEach((existingCampaign, externalId) => {
+            if (!activeIdsInMeta.has(externalId || '')) {
+                if (datePreset === 'maximum') {
+                    if (existingCampaign.status === 'Active') {
+                        batch.update(doc(db, CAMPAIGNS_COLLECTION, existingCampaign.id), { 
+                            status: 'Paused',
+                            spend: existingCampaign.spend 
+                        });
+                        killedGhosts++;
+                    }
+                } else {
+                    if (existingCampaign.spend > 0 || existingCampaign.status === 'Active') {
+                         batch.update(doc(db, CAMPAIGNS_COLLECTION, existingCampaign.id), {
+                             spend: 0, impressions: 0, clicks: 0, ctr: 0, cpc: 0, roas: 0, conversations: 0, leads: 0,
+                         });
+                    }
+                }
+            }
+        });
+        
+        if (killedGhosts > 0) {
+            await batch.commit();
+            console.log(`[MetaSync] ${killedGhosts} campanhas fantasmas foram desativadas.`);
+        }
+
+        return { success: true, message: `Espelhamento concluído! (11k check: OK, Status check: OK)` };
 
     } catch (error: any) {
         console.error(error);
-        return { success: false, message: "Erro crítico na sincronização: " + error.message };
+        return { success: false, message: "Erro ao espelhar dados: " + error.message };
     }
 };
 

@@ -20,6 +20,10 @@ export interface UserProfile {
   adAccountId?: string; // ID da conta de anúncios externa (ex: act_123456)
 }
 
+export interface BreakdownData {
+    [key: string]: number; // ex: "18-24": 1500 (impressions or spend)
+}
+
 export interface Campaign {
   id: string;
   clientId?: string;
@@ -35,6 +39,11 @@ export interface Campaign {
   conversations?: number; // Novas conversas de mensagem
   leads?: number; // Cadastros
   platform: 'Meta' | 'Google' | 'TikTok';
+  
+  // Dados Reais de Breakdown
+  ageBreakdown?: BreakdownData; 
+  genderBreakdown?: BreakdownData;
+  platformBreakdown?: BreakdownData;
 }
 
 export enum TaskStatus {
